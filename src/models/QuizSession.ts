@@ -221,5 +221,6 @@ const QuizSessionSchema: Schema = new Schema(
 // Index for optimizing searches
 QuizSessionSchema.index({ user: 1, quizDate: -1 });
 QuizSessionSchema.index({ quiz: 1, user: 1 }); // To quickly find a user's sessions for a given quiz
+QuizSessionSchema.index({ quiz: 1, guestId: 1 }, { unique: true, sparse: true });
 
 export const QuizSession = mongoose.model<IQuizSession>('QuizSession', QuizSessionSchema);

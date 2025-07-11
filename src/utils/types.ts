@@ -60,6 +60,7 @@ export enum ContentAccessLevel {
   RESTRICTED = 'restricted'     // Accessible uniquement aux membres d'une formation.
 }
 
+
 export enum EnrollmentStatus {
   PENDING = 'pending',
   APPROVED = 'approved',

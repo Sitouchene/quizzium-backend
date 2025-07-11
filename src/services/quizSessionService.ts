@@ -8,24 +8,21 @@ import { Training, ITraining } from '../models/Training';
 import { ApiError, AvailableLanguage, QuestionType, UserRole, NotificationType, QuizType } from '../utils/types';
 import { createNotificationService } from './notificationService';
 import { Types } from 'mongoose';
-import { checkUserAccessToQuiz } from './permissionService';
-
 
 // Interfaces for QuizSession Data
 interface StartQuizSessionData {
-  quizId: string;
-  language: AvailableLanguage;
-  user?: { id: string; role: UserRole }; // Utilisateur authentifié (optionnel)
-  guest?: { guestId: string; name: string }; // Joueur invité (optionnel)
+  user: string;
+  quizId: string; // Now directly referencing the Quiz model
+  language: AvailableLanguage; // Utilise l'enum AvailableLanguage
 }
 
 interface SubmitQuizSessionData {
   responses: Array<{
-    question: string;
-    userAnswer: string | string[] | number;
+    question: string; // Question ID
+    userAnswer: string | string[] | number; // User's answer
     timeTakenSeconds?: number;
   }>;
-  durationSeconds: number;
+  durationSeconds: number; // Total duration of the quiz session
 }
 
 
@@ -38,77 +35,112 @@ interface SubmitQuizSessionData {
  * @throws ApiError if user, quiz are invalid, or attempts exceeded.
  */
 export const startQuizSessionService = async (data: StartQuizSessionData): Promise<IQuizSession> => {
-  const { user: userId, quizId, language, guest } = data;
+  const { user: userId, quizId, language } = data;
 
-  // 1. Validate user / guest
+  // 1. Validate user
   const user = await User.findById(userId);
-  if (!user && !guest) {
-    throw new ApiError('A user or guest identifier is required to start a session.', 400);
+  if (!user) {
+    throw new ApiError('User not found.', 404);
   }
 
   // 2. Validate Quiz and populate its questions to get their full details
-    const quiz = await Quiz.findById(quizId).populate('questions.questionId').lean();
-  if (!quiz || !quiz.isPublished) {
-    throw new ApiError('Quiz not found or not published.', 404);
+  const quiz = await Quiz.findById(quizId).populate('questions.questionId').lean();
+  if (!quiz) {
+    throw new ApiError('Quiz not found.', 404);
   }
 
-  const hasAccess = await checkUserAccessToQuiz(user?.id, quiz._id);
-  if (!hasAccess) {
-    throw new ApiError('You are not authorized to start this quiz.', 403);
+  // Check if quiz is published if user is a student and it's not their own revision quiz
+  const isCreator = quiz.creator.toString() === userId;
+  // Utilisation des valeurs de l'enum UserRole et QuizType
+  if (user.role === UserRole.STUDENT && !quiz.isPublished && !(isCreator && quiz.quizType === QuizType.REVISION)) {
+    throw new ApiError('Quiz is not published or not accessible to you.', 403);
   }
 
-  if (user && quiz.allowedAttempts) {
-    const existingSessions = await QuizSession.countDocuments({ user: user.id, quiz: quizId });
+  // 3. Check allowed attempts
+  if (quiz.allowedAttempts !== null && quiz.allowedAttempts !== undefined) {
+    const existingSessions = await QuizSession.countDocuments({ user: new Types.ObjectId(userId), quiz: new Types.ObjectId(quizId) });
     if (existingSessions >= quiz.allowedAttempts) {
-      throw new ApiError('You have exceeded the maximum allowed attempts.', 403);
+      throw new ApiError(`You have exceeded the maximum number of allowed attempts (${quiz.allowedAttempts}) for this quiz.`, 403);
     }
   }
-
 
   // 4. Calculate max possible score for this session (sum of question scores defined in the Quiz)
   let maxPossibleScore = 0;
   const initialResponses: IQuestionResponse[] = [];
+
   for (const qItem of quiz.questions) {
-    const questionDoc = qItem.questionId as IQuestion;
-    if (questionDoc && questionDoc._id) {
-      maxPossibleScore += qItem.score;
-      initialResponses.push({
-        question: questionDoc._id,
-        userAnswer: '',
-        isCorrect: false,
-        scoreEarned: 0,
-      });
+    const questionDoc = qItem.questionId as IQuestion; // Cast to IQuestion after population
+    if (!questionDoc || !questionDoc._id) {
+      console.warn(`Question document missing or invalid for a question in quiz ${quizId}`);
+      continue;
     }
+
+    maxPossibleScore += qItem.score;
+
+    // IMPORTANT: Filter out sensitive information like 'isCorrect' and 'correctAnswerFormula'
+    // Utilisation de la valeur de l'enum QuestionType
+    const clientChoices = questionDoc.type === QuestionType.QCM && questionDoc.choices
+      ? questionDoc.choices.map(choice => ({ text: choice.text })) // Only send 'text', not 'isCorrect'
+      : undefined;
+
+    const clientQuestion: IClientQuestion = {
+      _id: questionDoc._id,
+      text: questionDoc.text,
+      type: questionDoc.type, // Utilise la valeur de l'enum QuestionType
+      choices: clientChoices,
+      difficulty: questionDoc.difficulty,
+      tags: questionDoc.tags,
+      // Do NOT include explanation or correctAnswerFormula here
+    };
+
+    initialResponses.push({
+      question: clientQuestion, // Embed the safe client-facing question object
+      userAnswer: '',
+      isCorrect: false, // This is for internal tracking, not exposed to client in the populated field
+      scoreEarned: 0,
+      timeTakenSeconds: 0,
+    });
   }
 
   if (maxPossibleScore === 0) {
-    throw new ApiError('Quiz has no valid questions or scores.', 400);
+    throw new ApiError('Quiz has no valid questions or question scores defined.', 400);
   }
 
-  const sessionData: Partial<IQuizSession> = {
+  const newSession = new QuizSession({
+    user: new Types.ObjectId(userId),
     quiz: new Types.ObjectId(quizId),
-    language,
+    quizDate: new Date(),
     totalScoreEarned: 0,
-    maxPossibleScore,
-    quizGlobalScore: quiz.globalScore,
-    finalCalculatedScore: 0,
-    durationSeconds: 0,
-    responses: initialResponses,
+    maxPossibleScore: maxPossibleScore,
+    quizGlobalScore: quiz.globalScore, // Copy global score from quiz
+    finalCalculatedScore: 0, // Will be calculated on submit
+    durationSeconds: 0, // Will be updated on completion
+    responses: initialResponses, // This now contains full question objects (but safe ones)
+    language, // Utilise l'enum AvailableLanguage
     isCompleted: false,
-  };
+    passStatus: undefined,
+    attemptNumber: (await QuizSession.countDocuments({ user: new Types.ObjectId(userId), quiz: new Types.ObjectId(quizId) })) + 1,
+  });
 
-  if (user) {
-    sessionData.user = new Types.ObjectId(user.id);
-    sessionData.attemptNumber = (await QuizSession.countDocuments({ user: user.id, quiz: quizId })) + 1;
-  } else if (guest) {
-    sessionData.guestId = guest.guestId;
-    sessionData.guestName = guest.name;
-    sessionData.attemptNumber = 1; // Pour les invités, on ne garde que la meilleure tentative
+  try {
+    const savedSession = await newSession.save();
+    // When returning, populate the 'question' field within 'responses' again,
+    // but with specific fields selected to ensure no sensitive data leaks.
+    const populatedSession = await QuizSession.findById(savedSession._id)
+      .populate({
+        path: 'responses.question',
+        select: 'text type choices.text difficulty tags' // Explicitly select fields, and ONLY 'choices.text'
+        // 'choices.isCorrect' and 'correctAnswerFormula' are NOT selected here.
+      })
+      .lean();
+    return populatedSession as IQuizSession; // Return the populated version
+  } catch (error: any) {
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map((val: any) => val.message);
+      throw new ApiError(messages.join(', '), 400);
+    }
+    throw new ApiError(`Failed to start quiz session: ${error.message || 'Unknown error'}`, 500);
   }
-
-  const newSession = new QuizSession(sessionData);
-  await newSession.save();
-  return newSession;
 };
 
 
